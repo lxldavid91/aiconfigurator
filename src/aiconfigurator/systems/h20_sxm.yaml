@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+data_dir: data/h20_sxm # relative to systems_dir
+gpu:
+  mem_bw: 4000000000000 # 4000GB/s (H20 has slightly lower bandwidth than H200)
+  mem_bw_empirical_scaling_factor: 0.8 # some nonofficial correction based on observations
+  mem_empirical_constant_latency: 0.000003 # 3us
+  mem_capacity: 150300000000 # ~140GiB (143771 MiB)
+  float16_tc_flops: 500000000000000 # ~500 TFLOPS (H20 has fewer SMs than H200)
+  int8_tc_flops: 1000000000000000 # ~1000 TFLOPS
+  fp8_tc_flops: 1000000000000000 # ~1000 TFLOPS
+  power: 500  # Watt (H20 TDP)
+  sm_version: 90  # Hopper architecture
+
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 25000000000  # Byte/s per GPU, single direction
+  intra_node_bw: 400000000000  # Byte/s per gpu, single direction (NVLink)
+  pcie_bw: 64000000000  # Byte/s, single direction, pcie 5.0
+  p2p_latency: 0.00001  # 10us
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992 # 342MB
+    4: 411041792 # 392MB
+    8: 411041792 # 392MB
+  other_mem: 3758096384 # 3.5GB
+  nccl_version: '2.26.2'
