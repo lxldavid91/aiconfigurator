@@ -446,21 +446,29 @@ def _parse_hf_config_json(config: dict) -> dict:
             f"Supported architectures: {', '.join(ARCHITECTURE_TO_MODEL_FAMILY.keys())}"
         )
 
-    layers = config["num_hidden_layers"]
-    hidden_size = config["hidden_size"]
-    n = config["num_attention_heads"]
-    vocab = config["vocab_size"]
-    context = config["max_position_embeddings"]
+    # Handle Qwen3.5 nested text_config structure
+    # Qwen3.5 has text_config nested inside config, with VLM parameters at top level
+    text_config = config.get("text_config", {})
+    
+    # Use text_config if available (Qwen3.5), otherwise use config directly
+    cfg = text_config if text_config else config
+
+    layers = cfg.get("num_hidden_layers", config.get("num_hidden_layers", 0))
+    hidden_size = cfg.get("hidden_size", config.get("hidden_size", 0))
+    n = cfg.get("num_attention_heads", config.get("num_attention_heads", 0))
+    vocab = cfg.get("vocab_size", config.get("vocab_size", 0))
+    context = cfg.get("max_position_embeddings", config.get("max_position_embeddings", 0))
 
     # Handle nullable fields (e.g., Nemotron has null for these)
-    n_kv = config.get("num_key_value_heads") or 0
-    inter_size = config.get("intermediate_size") or 0
-    d = config.get("head_dim") or config.get("attention_head_dim") or (hidden_size // n if n > 0 else 0)
+    n_kv = cfg.get("num_key_value_heads") or config.get("num_key_value_heads") or 0
+    inter_size = cfg.get("intermediate_size") or config.get("intermediate_size") or 0
+    d = cfg.get("head_dim") or cfg.get("attention_head_dim") or config.get("head_dim") or (hidden_size // n if n > 0 else 0)
 
     # MoE parameters
-    topk = config.get("num_experts_per_tok", 0)
-    num_experts = config.get("num_local_experts") or config.get("n_routed_experts") or config.get("num_experts", 0)
-    moe_inter_size = config.get("moe_intermediate_size", 0) or config.get("intermediate_size", 0)
+    topk = cfg.get("num_experts_per_tok", config.get("num_experts_per_tok", 0))
+    num_experts = cfg.get("num_local_experts") or cfg.get("n_routed_experts") or cfg.get("num_experts") or \
+                  config.get("num_local_experts") or config.get("n_routed_experts") or config.get("num_experts", 0)
+    moe_inter_size = cfg.get("moe_intermediate_size", config.get("moe_intermediate_size", 0)) or inter_size
 
     # Handle NemotronH-specific configuration (only fields unique to NemotronH)
     extra_params = None
@@ -483,6 +491,51 @@ def _parse_hf_config_json(config: dict) -> dict:
     elif architecture == "DeciLMForCausalLM":
         if "block_configs" in config:
             extra_params = _parse_nemotron_block_configs(config["block_configs"])
+    elif architecture == "Qwen3_5ForConditionalGeneration":
+        # Qwen3.5 hybrid configuration (Gated DeltaNet + Full Attention)
+        layer_types = cfg.get("layer_types", [])
+        
+        # Parse vision config if present (multimodal)
+        vision_cfg = None
+        if "vision_config" in config:
+            vc = config["vision_config"]
+            vision_cfg = common.VisionConfig(
+                depth=vc.get("depth", 27),
+                hidden_size=vc.get("hidden_size", 1152),
+                num_heads=vc.get("num_heads", 16),
+                intermediate_size=vc.get("intermediate_size", 4304),
+                patch_size=vc.get("patch_size", 16),
+                in_channels=vc.get("in_channels", 3),
+                num_position_embeddings=vc.get("num_position_embeddings", 2304),
+                out_hidden_size=vc.get("out_hidden_size", 5120),
+                spatial_merge_size=vc.get("spatial_merge_size", 2),
+                temporal_patch_size=vc.get("temporal_patch_size", 2),
+            )
+            logger.info(
+                f"Qwen3.5 vision config: depth={vision_cfg.depth}, "
+                f"hidden_size={vision_cfg.hidden_size}, num_heads={vision_cfg.num_heads}"
+            )
+        
+        extra_params = common.Qwen3_5Config(
+            layer_types=tuple(layer_types),
+            full_attention_interval=cfg.get("full_attention_interval", 4),
+            linear_conv_kernel_dim=cfg.get("linear_conv_kernel_dim", 4),
+            linear_key_head_dim=cfg.get("linear_key_head_dim", 128),
+            linear_num_key_heads=cfg.get("linear_num_key_heads", 16),
+            linear_num_value_heads=cfg.get("linear_num_value_heads", 48),
+            linear_value_head_dim=cfg.get("linear_value_head_dim", 128),
+            mtp_num_hidden_layers=cfg.get("mtp_num_hidden_layers", 0),
+            attn_output_gate=cfg.get("attn_output_gate", True),
+            vision_config=vision_cfg,
+        )
+        linear_count = sum(1 for t in layer_types if t == "linear_attention")
+        full_count = sum(1 for t in layer_types if t == "full_attention")
+        logger.info(
+            f"Qwen3.5 hybrid config: layers={len(layer_types)}, "
+            f"linear_attention={linear_count}, full_attention={full_count}, "
+            f"interval={extra_params.full_attention_interval}, "
+            f"multimodal={vision_cfg is not None}"
+        )
 
     logger.info(
         f"Model architecture: architecture={architecture}, layers={layers}, n={n}, n_kv={n_kv}, d={d}, "

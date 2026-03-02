@@ -1,0 +1,441 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: "Multi-Backend Test Matrix"
+
+on:
+  push:
+    branches:
+      - main
+      - "release/*"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+    paths:
+      - 'src/**'
+      - 'tests/backends/**'
+      - 'pyproject.toml'
+      - '.github/workflows/backend-matrix.yml'
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: 'Backends to test (comma-separated, e.g., sglang,trtllm,vllm)'
+        required: false
+        default: 'all'
+        type: string
+      gpu_types:
+        description: 'GPU types to test (comma-separated, e.g., h200,h100,h20)'
+        required: false
+        default: 'all'
+        type: string
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Registry settings
+  REGISTRY: nvcr.io/nvidia/ai-dynamo
+  # Timeout settings
+  TEST_TIMEOUT_MINUTES: 60
+  # Artifact settings
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  # ============================================
+  # Job 1: Determine Test Matrix
+  # ============================================
+  prepare-matrix:
+    name: Prepare Test Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      backend_matrix: ${{ steps.set-matrix.outputs.backend_matrix }}
+      should_run: ${{ steps.check-changes.outputs.should_run }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        id: check-changes
+        run: |
+          # Always run on main branch or manual trigger
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check for changes in relevant paths
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          
+          if echo "$CHANGED_FILES" | grep -qE '(src/|tests/backends/|pyproject.toml|\.github/workflows/backend-matrix)'; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build test matrix
+        id: set-matrix
+        run: |
+          # Default configurations
+          declare -A BACKEND_CONFIGS=(
+            ["sglang"]="lmsysorg/sglang:v0.5.6.post2-cu130-amd64-runtime"
+            ["trtllm"]="nvcr.io/nvidia/tensorrt-llm:v0.20.0-py3"
+            ["vllm"]="vllm/vllm-openai:v0.14.0"
+          )
+          
+          declare -A GPU_CONFIGS=(
+            ["h200"]="self-hosted-h200"
+            ["h100"]="self-hosted-h100"
+            ["h20"]="self-hosted-h20"
+            ["a100"]="self-hosted-a100"
+          )
+          
+          # Parse inputs
+          if [[ "${{ github.event.inputs.backends }}" != "" ]] && [[ "${{ github.event.inputs.backends }}" != "all" ]]; then
+            IFS=',' read -ra SELECTED_BACKENDS <<< "${{ github.event.inputs.backends }}"
+          else
+            SELECTED_BACKENDS=("sglang" "trtllm" "vllm")
+          fi
+          
+          if [[ "${{ github.event.inputs.gpu_types }}" != "" ]] && [[ "${{ github.event.inputs.gpu_types }}" != "all" ]]; then
+            IFS=',' read -ra SELECTED_GPUS <<< "${{ github.event.inputs.gpu_types }}"
+          else
+            SELECTED_GPUS=("h200" "h100" "h20")
+          fi
+          
+          # Build matrix
+          MATRIX="[]"
+          for backend in "${SELECTED_BACKENDS[@]}"; do
+            if [[ -n "${BACKEND_CONFIGS[$backend]}" ]]; then
+              for gpu in "${SELECTED_GPUS[@]}"; do
+                if [[ -n "${GPU_CONFIGS[$gpu]}" ]]; then
+                  MATRIX=$(echo "$MATRIX" | jq -c \
+                    --arg backend "$backend" \
+                    --arg image "${BACKEND_CONFIGS[$backend]}" \
+                    --arg gpu "$gpu" \
+                    --arg runner "${GPU_CONFIGS[$gpu]}" \
+                    '. + [{"backend": $backend, "image": $image, "gpu": $gpu, "runner": $runner}]')
+                fi
+              done
+            fi
+          done
+          
+          echo "backend_matrix={\"include\":$(echo "$MATRIX")}" >> $GITHUB_OUTPUT
+          
+          # Print matrix for debugging
+          echo "### Test Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "$MATRIX" | jq -r '.[] | "- Backend: \(.backend), GPU: \(.gpu), Runner: \(.runner)"' >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Job 2: Run Backend Tests
+  # ============================================
+  backend-tests:
+    name: Test ${{ matrix.backend }} on ${{ matrix.gpu }}
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_run == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ fromJSON(env.TEST_TIMEOUT_MINUTES) }}
+    
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.backend_matrix) }}
+    
+    permissions:
+      contents: read
+      packages: read
+    
+    outputs:
+      test_result: ${{ steps.run-tests.outcome }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+      
+      - name: Git LFS Pull
+        run: git lfs pull
+      
+      - name: Setup test environment
+        run: |
+          # Create test directories
+          mkdir -p /tmp/test-results
+          mkdir -p /tmp/perf-data
+          
+          # Set environment variables
+          echo "BACKEND=${{ matrix.backend }}" >> $GITHUB_ENV
+          echo "GPU_TYPE=${{ matrix.gpu }}" >> $GITHUB_ENV
+          echo "TEST_RESULTS_DIR=/tmp/test-results" >> $GITHUB_ENV
+
+      - name: Pull container image
+        run: |
+          docker pull ${{ matrix.image }}
+          
+          # Tag for easier reference
+          docker tag ${{ matrix.image }} test-runner:latest
+
+      - name: Run unit tests
+        id: run-tests
+        run: |
+          # Run tests in container
+          docker run --rm \
+            --gpus all \
+            --network host \
+            -v ${{ github.workspace }}:/workspace \
+            -v /tmp/test-results:/test-results \
+            -e BACKEND=${{ matrix.backend }} \
+            -e GPU_TYPE=${{ matrix.gpu }} \
+            -w /workspace \
+            test-runner:latest \
+            bash -c "
+              set -e
+              
+              # Install test dependencies
+              pip install -e .[dev]
+              
+              # Run backend-specific tests
+              pytest tests/backends/${{ matrix.backend }}/ \
+                -v \
+                --tb=short \
+                --timeout=300 \
+                --junit-xml=/test-results/junit-${{ matrix.backend }}-${{ matrix.gpu }}.xml \
+                --html=/test-results/report-${{ matrix.backend }}-${{ matrix.gpu }}.html \
+                --self-contained-html \
+                -n 4 || exit_code=\$?
+              
+              # Run sanity check on performance data
+              if [ -d 'tests/backends/${{ matrix.backend }}/perf' ]; then
+                python tools/sanity_check/validate_perf_data.py \
+                  --backend ${{ matrix.backend }} \
+                  --gpu ${{ matrix.gpu }} \
+                  --data-dir systems/data/
+              fi
+              
+              exit \${exit_code:-0}
+            "
+
+      - name: Collect performance data
+        if: always()
+        run: |
+          # Copy any generated performance data
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v /tmp/perf-data:/perf-data \
+            test-runner:latest \
+            bash -c "
+              if [ -d '/workspace/systems/data' ]; then
+                cp -r /workspace/systems/data/* /perf-data/ || true
+              fi
+            "
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.backend }}-${{ matrix.gpu }}
+          path: |
+            /tmp/test-results/*.xml
+            /tmp/test-results/*.html
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+      - name: Upload performance data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-${{ matrix.backend }}-${{ matrix.gpu }}
+          path: /tmp/perf-data/
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## Test Results: ${{ matrix.backend }} on ${{ matrix.gpu }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | ${{ matrix.backend }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| GPU | ${{ matrix.gpu }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.run-tests.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duration | \${{ job.duration }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Job 3: Aggregate Results
+  # ============================================
+  aggregate-results:
+    name: Aggregate Test Results
+    needs: backend-tests
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+
+      - name: Merge test reports
+        run: |
+          # Install junit parser
+          pip install junitparser
+          
+          # Merge JUnit reports
+          python3 << 'EOF'
+          import os
+          from junitparser import JUnitXml
+          from glob import glob
+          
+          merged = JUnitXml()
+          for file in glob('all-results/*/junit-*.xml'):
+              merged += JUnitXml.fromfile(file)
+          
+          merged.write('merged-junit.xml')
+          
+          # Print summary
+          print(f"Total tests: {merged.tests}")
+          print(f"Passed: {merged.tests - merged.failures - merged.errors - merged.skipped}")
+          print(f"Failed: {merged.failures}")
+          print(f"Errors: {merged.errors}")
+          print(f"Skipped: {merged.skipped}")
+          EOF
+
+      - name: Generate summary report
+        run: |
+          echo "# Multi-Backend Test Matrix Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Overall Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse and display results
+          find all-results -name "junit-*.xml" | while read file; do
+            backend=$(basename "$file" | sed 's/junit-//' | sed 's/.xml//' | cut -d'-' -f1)
+            gpu=$(basename "$file" | sed 's/junit-//' | sed 's/.xml//' | cut -d'-' -f2)
+            
+            # Extract test counts
+            tests=$(grep -oP 'tests="\K[0-9]+' "$file" | head -1)
+            failures=$(grep -oP 'failures="\K[0-9]+' "$file" | head -1)
+            errors=$(grep -oP 'errors="\K[0-9]+' "$file" | head -1)
+            
+            passed=$((tests - failures - errors))
+            status="✅"
+            [ "$failures" -gt 0 ] || [ "$errors" -gt 0 ] && status="❌"
+            
+            echo "- $status **${backend}** on **${gpu}**: $passed/$tests passed" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Upload merged report
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-test-report
+          path: merged-junit.xml
+          retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
+
+      - name: Check for failures
+        run: |
+          # Fail the workflow if any tests failed
+          if grep -q 'failures="[1-9]' merged-junit.xml || grep -q 'errors="[1-9]' merged-junit.xml; then
+            echo "::error::Some tests failed. Check the detailed reports."
+            exit 1
+          fi
+
+  # ============================================
+  # Job 4: Performance Data Validation
+  # ============================================
+  validate-performance:
+    name: Validate Performance Data
+    needs: aggregate-results
+    if: success()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download performance data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: perf-data-*
+          path: perf-data
+          merge-multiple: true
+
+      - name: Validate data quality
+        run: |
+          python3 << 'EOF'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          
+          print("### Performance Data Validation")
+          print("")
+          
+          issues = []
+          
+          for file in Path('perf-data').glob('*.txt'):
+              try:
+                  df = pd.read_csv(file)
+                  
+                  # Check for empty data
+                  if len(df) == 0:
+                      issues.append(f"- ⚠️ {file.name}: Empty file")
+                      continue
+                  
+                  # Check for missing values
+                  missing = df.isnull().sum().sum()
+                  if missing > 0:
+                      issues.append(f"- ⚠️ {file.name}: {missing} missing values")
+                  
+                  # Check for reasonable latency values
+                  if 'latency' in df.columns:
+                      max_latency = df['latency'].max()
+                      if max_latency > 10000:  # 10 seconds
+                          issues.append(f"- ⚠️ {file.name}: Suspicious latency value {max_latency}ms")
+                  
+                  print(f"- ✅ {file.name}: {len(df)} records, {len(df.columns)} columns")
+                  
+              except Exception as e:
+                  issues.append(f"- ❌ {file.name}: Parse error - {e}")
+          
+          if issues:
+              print("\n### Issues Found")
+              for issue in issues:
+                  print(issue)
+          else:
+              print("\n✅ All performance data validated successfully")
+          EOF
+
+      - name: Generate performance summary
+        run: |
+          echo "## Performance Data Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count files and records
+          total_files=$(find perf-data -name "*.txt" | wc -l)
+          total_records=$(cat perf-data/*.txt 2>/dev/null | wc -l)
+          
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Files | $total_files |" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Records | $total_records |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Job 5: Notify on Failure
+  # ============================================
+  notify-failure:
+    name: Notify on Failure
+    needs: [backend-tests, aggregate-results]
+    if: failure()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Create failure summary
+        run: |
+          echo "## ❌ Multi-Backend Test Matrix Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "One or more backend tests failed. Please check the detailed reports." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY

@@ -1382,3 +1382,195 @@ class Mamba2(Operation):
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
+
+
+class VisionEncoder(Operation):
+    """
+    Vision Encoder operation for multimodal models (e.g., Qwen3.5-VL).
+
+    Models a Vision Transformer (ViT) encoder that processes images into visual tokens.
+    The encoder consists of:
+    1. Patch Embedding: Conv2D to extract patches
+    2. Position Embedding: Add position information
+    3. Transformer Layers: Self-attention + FFN
+    4. Spatial Merge: Downsample visual tokens
+
+    For performance modeling, we focus on the compute-intensive operations:
+    - Patch embedding (conv2d-like)
+    - Self-attention in each layer
+    - FFN (MLP) in each layer
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        depth: int,
+        hidden_size: int,
+        num_heads: int,
+        intermediate_size: int,
+        patch_size: int,
+        in_channels: int = 3,
+        quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.float16,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._depth = depth
+        self._hidden_size = hidden_size
+        self._num_heads = num_heads
+        self._intermediate_size = intermediate_size
+        self._patch_size = patch_size
+        self._in_channels = in_channels
+        self._quant_mode = quant_mode
+        self._head_dim = hidden_size // num_heads
+
+        # Weights: patch_embed + layers (attn + ffn)
+        # patch_embed: in_channels * patch_size^2 * hidden_size
+        # Each layer: 4 * hidden_size^2 (QKV + proj) + 2 * hidden_size * intermediate_size (FFN)
+        self._weights = (
+            in_channels * patch_size * patch_size * hidden_size
+            + depth * (4 * hidden_size * hidden_size + 2 * hidden_size * intermediate_size)
+        ) * quant_mode.value.memory
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """
+        Query Vision Encoder latency.
+
+        Args:
+            num_patches: Number of image patches (e.g., 256 for 224x224 image with 14x14 patches)
+                        Default: 256 (typical for 224x224 image with patch_size=16)
+        """
+        # Default num_patches: 256 (16x16 grid for typical 256x256 image with patch_size=16)
+        num_patches = kwargs.get("num_patches", 256)
+
+        total_latency = 0.0
+        total_energy = 0.0
+
+        # 1. Patch Embedding (treat as GEMM: num_patches * hidden_size)
+        # Conv2D with kernel_size=patch_size is equivalent to linear projection per patch
+        patch_embed_result = database.query_gemm(
+            num_patches, self._hidden_size, self._in_channels * self._patch_size * self._patch_size, self._quant_mode
+        )
+        total_latency += float(patch_embed_result)
+        total_energy += patch_embed_result.energy
+
+        # 2. Position Embedding (element-wise add)
+        pos_bytes = num_patches * self._hidden_size * 2 * 2  # read + write
+        pos_result = database.query_mem_op(pos_bytes)
+        total_latency += float(pos_result)
+        total_energy += pos_result.energy
+
+        # 3. Transformer Layers
+        for _ in range(self._depth):
+            # 3a. Self-Attention: QKV projection + attention + output projection
+            # QKV: 3 * (num_patches, hidden_size) @ (hidden_size, hidden_size)
+            qkv_result = database.query_gemm(
+                num_patches, 3 * self._hidden_size, self._hidden_size, self._quant_mode
+            )
+            total_latency += float(qkv_result)
+            total_energy += qkv_result.energy
+
+            # Attention computation (memory-bound for large num_patches)
+            # Read Q, K, V: 3 * num_patches * hidden_size
+            # Write output: num_patches * hidden_size
+            attn_bytes = 4 * num_patches * self._hidden_size * 2
+            attn_result = database.query_mem_op(attn_bytes)
+            total_latency += float(attn_result)
+            total_energy += attn_result.energy
+
+            # Output projection
+            out_result = database.query_gemm(
+                num_patches, self._hidden_size, self._hidden_size, self._quant_mode
+            )
+            total_latency += float(out_result)
+            total_energy += out_result.energy
+
+            # 3b. FFN: up_proj -> activation -> down_proj
+            up_result = database.query_gemm(
+                num_patches, self._intermediate_size, self._hidden_size, self._quant_mode
+            )
+            total_latency += float(up_result)
+            total_energy += up_result.energy
+
+            # Activation (element-wise)
+            act_bytes = num_patches * self._intermediate_size * 2 * 2
+            act_result = database.query_mem_op(act_bytes)
+            total_latency += float(act_result)
+            total_energy += act_result.energy
+
+            down_result = database.query_gemm(
+                num_patches, self._hidden_size, self._intermediate_size, self._quant_mode
+            )
+            total_latency += float(down_result)
+            total_energy += down_result.energy
+
+        return PerformanceResult(
+            latency=total_latency * self._scale_factor,
+            energy=total_energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class VisionMerger(Operation):
+    """
+    Vision Merger operation that maps visual tokens to LLM hidden dimension.
+
+    For Qwen3.5-VL, this includes:
+    1. Spatial merge: Downsample visual tokens by merging adjacent tokens
+    2. Linear projection: Map from vision hidden_size to LLM hidden_size
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        vision_hidden_size: int,
+        llm_hidden_size: int,
+        spatial_merge_size: int = 2,
+        quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.float16,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._vision_hidden_size = vision_hidden_size
+        self._llm_hidden_size = llm_hidden_size
+        self._spatial_merge_size = spatial_merge_size
+        self._quant_mode = quant_mode
+
+        # Weights: 2 FC layers for merger (typical architecture)
+        self._weights = 2 * vision_hidden_size * llm_hidden_size * quant_mode.value.memory
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """
+        Query Vision Merger latency.
+
+        Args:
+            num_patches: Number of input visual tokens (before spatial merge)
+        """
+        num_patches = kwargs.get("num_patches", 256)
+
+        # Spatial merge reduces num_patches by spatial_merge_size^2
+        merged_patches = num_patches // (self._spatial_merge_size * self._spatial_merge_size)
+
+        total_latency = 0.0
+        total_energy = 0.0
+
+        # 1. Spatial merge (concatenation + reshape, memory-bound)
+        merge_bytes = num_patches * self._vision_hidden_size * 2
+        merge_result = database.query_mem_op(merge_bytes)
+        total_latency += float(merge_result)
+        total_energy += merge_result.energy
+
+        # 2. Linear projection: vision_hidden_size -> llm_hidden_size
+        proj_result = database.query_gemm(
+            merged_patches, self._llm_hidden_size, self._vision_hidden_size, self._quant_mode
+        )
+        total_latency += float(proj_result)
+        total_energy += proj_result.energy
+
+        return PerformanceResult(
+            latency=total_latency * self._scale_factor,
+            energy=total_energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
