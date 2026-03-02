@@ -1437,7 +1437,9 @@ class VisionEncoder(Operation):
 
         Args:
             num_patches: Number of image patches (e.g., 256 for 224x224 image with 14x14 patches)
+                        Default: 256 (typical for 224x224 image with patch_size=16)
         """
+        # Default num_patches: 256 (16x16 grid for typical 256x256 image with patch_size=16)
         num_patches = kwargs.get("num_patches", 256)
 
         total_latency = 0.0
