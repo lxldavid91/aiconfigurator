@@ -309,6 +309,24 @@ def get_model(
         )
         # extra_params is NemotronHConfig with hybrid layer configuration
         model.set_hybrid_config(extra_params)
+    elif model_family == "QWEN35":
+        model = Qwen3_5Model(
+            model_path,
+            model_family,
+            architecture,
+            layers,
+            n,
+            n_kv,
+            d,
+            hidden,
+            inter,
+            vocab,
+            context,
+            model_config,
+        )
+        # extra_params is Qwen3_5Config with hybrid layer configuration
+        if extra_params:
+            model.set_hybrid_config(extra_params)
 
     return model
 
@@ -2974,6 +2992,378 @@ class NemotronHModel(BaseModel):
                     ops.CustomAllReduce("generation_mlp_ar", count, h, tp_size),
                 ]
             )
+
+        # P2P communication for PP
+        pp_scale_factor = pp_size - 1
+        self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor, h, pp_size))
+
+        # Logits GEMM
+        self.generation_ops.append(
+            ops.GEMM(
+                "generation_logits_gemm",
+                1,
+                self._vocab_size // tp_size,
+                h,
+                common.GEMMQuantMode.float16,
+            )
+        )
+
+
+class Qwen3_5Model(BaseModel):
+    """
+    Qwen3.5 hybrid model implementation (Gated DeltaNet + Full Attention).
+
+    Qwen3.5 uses a hybrid architecture where most layers are linear attention
+    (Gated DeltaNet, a Mamba2 variant) and every Nth layer is full attention.
+    Typical ratio is 3:1 (3 linear attention layers per 1 full attention layer).
+
+    Gated DeltaNet combines Mamba2's gated decay mechanism with a delta rule
+    for updating hidden states, providing efficient long-context modeling.
+    """
+
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+        self._hybrid_config: common.Qwen3_5Config | None = None
+
+    def set_hybrid_config(self, hybrid_config: common.Qwen3_5Config) -> None:
+        """
+        Set the hybrid layer configuration and build operation pipelines.
+
+        Args:
+            hybrid_config: Qwen3_5Config containing layer_types and linear attention parameters
+        """
+        self._hybrid_config = hybrid_config
+        self._build_context_ops()
+        self._build_generation_ops()
+
+    def _count_layer_types(self) -> dict[str, int]:
+        """Count occurrences of each layer type."""
+        if not self._hybrid_config:
+            return {"linear_attention": 0, "full_attention": 0}
+        layer_types = self._hybrid_config.layer_types
+        return {
+            "linear_attention": sum(1 for t in layer_types if t == "linear_attention"),
+            "full_attention": sum(1 for t in layer_types if t == "full_attention"),
+        }
+
+    def _build_context_ops(self) -> None:
+        """Build the context (prefill) operations pipeline."""
+        if not self._hybrid_config:
+            return
+
+        h = self._hidden_size
+        tp_size = self.config.tp_size
+        pp_size = self.config.pp_size
+        gemm_quant_mode = self.config.gemm_quant_mode
+        kvcache_quant_mode = self.config.kvcache_quant_mode
+        fmha_quant_mode = self.config.fmha_quant_mode
+
+        layer_counts = self._count_layer_types()
+        cfg = self._hybrid_config
+
+        num_kv_heads_per_gpu = (self._num_kv_heads + tp_size - 1) // tp_size
+
+        self.context_ops = []
+
+        # Embedding
+        self.context_ops.append(ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3))
+
+        # Linear Attention layers (Gated DeltaNet - Mamba2 variant)
+        if layer_counts["linear_attention"] > 0:
+            count = layer_counts["linear_attention"]
+            # Gated DeltaNet parameters
+            # linear_key_head_dim, linear_value_head_dim define the head dimensions
+            # linear_num_key_heads, linear_num_value_heads define the number of heads
+            nheads = cfg.linear_num_key_heads
+            head_dim = cfg.linear_key_head_dim
+            d_state = 128  # Default SSM state size (typical for Mamba2 variants)
+            d_conv = cfg.linear_conv_kernel_dim
+            n_groups = cfg.linear_num_key_heads // 4  # Approximate group count
+            chunk_size = 256  # Default chunk size for chunked scan
+
+            # Calculate per-GPU dimensions after TP sharding
+            nheads_per_gpu = nheads // tp_size
+            d_inner_per_gpu = nheads_per_gpu * head_dim
+            n_groups_per_gpu = max(1, n_groups // tp_size)
+            in_proj_out_per_gpu = 2 * d_inner_per_gpu + 2 * n_groups_per_gpu * d_state + nheads_per_gpu
+
+            self.context_ops.extend(
+                [
+                    ops.ElementWise("context_linear_norm", count, 2 * h, 2 * h, 0.8),
+                    ops.GEMM(
+                        "context_linear_in_proj_gemm",
+                        count,
+                        in_proj_out_per_gpu,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    # Conv1D operation (using Mamba2Kernel approximation)
+                    ops.Mamba2Kernel(
+                        "context_linear_conv1d",
+                        count,
+                        "causal_conv1d_fn",
+                        "context",
+                        hidden_size=h,
+                        nheads=nheads,
+                        head_dim=head_dim,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        n_groups=n_groups,
+                        chunk_size=chunk_size,
+                    ),
+                    # SSM scan operation
+                    ops.Mamba2Kernel(
+                        "context_linear_ssm",
+                        count,
+                        "mamba_chunk_scan_combined",
+                        "context",
+                        hidden_size=h,
+                        nheads=nheads,
+                        head_dim=head_dim,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        n_groups=n_groups,
+                        chunk_size=chunk_size,
+                    ),
+                    ops.GEMM(
+                        "context_linear_out_proj_gemm",
+                        count,
+                        h,
+                        d_inner_per_gpu,
+                        gemm_quant_mode,
+                    ),
+                    ops.CustomAllReduce("context_linear_ar", count, h, tp_size),
+                ]
+            )
+
+        # Full Attention layers
+        if layer_counts["full_attention"] > 0:
+            count = layer_counts["full_attention"]
+            self.context_ops.extend(
+                [
+                    ops.ElementWise("context_attn_norm", count, 2 * h, 2 * h, 0.8),
+                    ops.GEMM(
+                        "context_qkv_gemm",
+                        count,
+                        self._num_heads * self._head_size // tp_size + self._head_size * num_kv_heads_per_gpu * 2,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    ops.ContextAttention(
+                        "context_attention",
+                        count,
+                        self._num_heads // tp_size,
+                        num_kv_heads_per_gpu,
+                        kvcache_quant_mode,
+                        fmha_quant_mode,
+                        head_size=self._head_size,
+                    ),
+                    ops.GEMM(
+                        "context_proj_gemm",
+                        count,
+                        h,
+                        self._num_heads * self._head_size // tp_size,
+                        gemm_quant_mode,
+                        low_precision_input=True,
+                    ),
+                    ops.CustomAllReduce("context_attn_ar", count, h, tp_size),
+                ]
+            )
+
+        # MLP layers (all layers have FFN)
+        total_layers = layer_counts["linear_attention"] + layer_counts["full_attention"]
+        self.context_ops.extend(
+            [
+                ops.ElementWise("context_mlp_norm", total_layers, 2 * h, 2 * h, 0.8),
+                ops.GEMM(
+                    "context_mlp_up_gemm",
+                    total_layers,
+                    self._inter_size // tp_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.ElementWise(
+                    "context_mlp_act",
+                    total_layers,
+                    self._inter_size // tp_size,
+                    self._inter_size // tp_size,
+                    0.8,
+                ),
+                ops.GEMM(
+                    "context_mlp_down_gemm",
+                    total_layers,
+                    h,
+                    self._inter_size // tp_size,
+                    gemm_quant_mode,
+                    low_precision_input=True,
+                ),
+                ops.CustomAllReduce("context_mlp_ar", total_layers, h, tp_size),
+            ]
+        )
+
+        # P2P communication for PP
+        pp_scale_factor = pp_size - 1
+        self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size))
+
+        # Logits GEMM
+        self.context_ops.append(
+            ops.GEMM(
+                "context_logits_gemm",
+                1,
+                self._vocab_size // tp_size,
+                h,
+                common.GEMMQuantMode.float16,
+            )
+        )
+
+    def _build_generation_ops(self) -> None:
+        """Build the generation (decode) operations pipeline."""
+        if not self._hybrid_config:
+            return
+
+        h = self._hidden_size
+        tp_size = self.config.tp_size
+        pp_size = self.config.pp_size
+        gemm_quant_mode = self.config.gemm_quant_mode
+        kvcache_quant_mode = self.config.kvcache_quant_mode
+
+        layer_counts = self._count_layer_types()
+        cfg = self._hybrid_config
+
+        num_kv_heads_per_gpu = (self._num_kv_heads + tp_size - 1) // tp_size
+
+        self.generation_ops = []
+
+        # Embedding
+        self.generation_ops.append(ops.Embedding("generation_embedding", 1, self._vocab_size, h, 0.3))
+
+        # Linear Attention layers (Gated DeltaNet)
+        if layer_counts["linear_attention"] > 0:
+            count = layer_counts["linear_attention"]
+            nheads = cfg.linear_num_key_heads
+            head_dim = cfg.linear_key_head_dim
+            d_state = 128
+            d_conv = cfg.linear_conv_kernel_dim
+            n_groups = cfg.linear_num_key_heads // 4
+            chunk_size = 256
+
+            nheads_per_gpu = nheads // tp_size
+            d_inner_per_gpu = nheads_per_gpu * head_dim
+            n_groups_per_gpu = max(1, n_groups // tp_size)
+            in_proj_out_per_gpu = 2 * d_inner_per_gpu + 2 * n_groups_per_gpu * d_state + nheads_per_gpu
+
+            self.generation_ops.extend(
+                [
+                    ops.ElementWise("generation_linear_norm", count, 2 * h, 2 * h, 0.8),
+                    ops.GEMM(
+                        "generation_linear_in_proj_gemm",
+                        count,
+                        in_proj_out_per_gpu,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    # Conv1D update (generation mode)
+                    ops.Mamba2Kernel(
+                        "generation_linear_conv1d",
+                        count,
+                        "causal_conv1d_update",
+                        "generation",
+                        hidden_size=h,
+                        nheads=nheads,
+                        head_dim=head_dim,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        n_groups=n_groups,
+                        chunk_size=chunk_size,
+                    ),
+                    # SSM state update (generation mode)
+                    ops.Mamba2Kernel(
+                        "generation_linear_ssm",
+                        count,
+                        "selective_state_update",
+                        "generation",
+                        hidden_size=h,
+                        nheads=nheads,
+                        head_dim=head_dim,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        n_groups=n_groups,
+                        chunk_size=chunk_size,
+                    ),
+                    ops.GEMM(
+                        "generation_linear_out_proj_gemm",
+                        count,
+                        h,
+                        d_inner_per_gpu,
+                        gemm_quant_mode,
+                    ),
+                    ops.CustomAllReduce("generation_linear_ar", count, h, tp_size),
+                ]
+            )
+
+        # Full Attention layers
+        if layer_counts["full_attention"] > 0:
+            count = layer_counts["full_attention"]
+            self.generation_ops.extend(
+                [
+                    ops.ElementWise("generation_attn_norm", count, 2 * h, 2 * h, 0.8),
+                    ops.GEMM(
+                        "generation_qkv_gemm",
+                        count,
+                        self._num_heads * self._head_size // tp_size + self._head_size * num_kv_heads_per_gpu * 2,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    ops.GenerationAttention(
+                        "generation_attention",
+                        count,
+                        self._num_heads // tp_size,
+                        num_kv_heads_per_gpu,
+                        kvcache_quant_mode,
+                        head_size=self._head_size,
+                    ),
+                    ops.GEMM(
+                        "generation_proj_gemm",
+                        count,
+                        h,
+                        self._num_heads * self._head_size // tp_size,
+                        gemm_quant_mode,
+                        low_precision_input=True,
+                    ),
+                    ops.CustomAllReduce("generation_attn_ar", count, h, tp_size),
+                ]
+            )
+
+        # MLP layers
+        total_layers = layer_counts["linear_attention"] + layer_counts["full_attention"]
+        self.generation_ops.extend(
+            [
+                ops.ElementWise("generation_mlp_norm", total_layers, 2 * h, 2 * h, 0.8),
+                ops.GEMM(
+                    "generation_mlp_up_gemm",
+                    total_layers,
+                    self._inter_size // tp_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.ElementWise(
+                    "generation_mlp_act",
+                    total_layers,
+                    self._inter_size // tp_size,
+                    self._inter_size // tp_size,
+                    0.8,
+                ),
+                ops.GEMM(
+                    "generation_mlp_down_gemm",
+                    total_layers,
+                    h,
+                    self._inter_size // tp_size,
+                    gemm_quant_mode,
+                    low_precision_input=True,
+                ),
+                ops.CustomAllReduce("generation_mlp_ar", total_layers, h, tp_size),
+            ]
+        )
 
         # P2P communication for PP
         pp_scale_factor = pp_size - 1

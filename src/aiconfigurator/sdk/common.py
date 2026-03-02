@@ -60,6 +60,37 @@ class NemotronHConfig:
     moe_shared_expert_intermediate_size: int = 0  # Optional: 0 for non-MoE NemotronH models
 
 
+@dataclass(frozen=True)
+class Qwen3_5Config:
+    """
+    Configuration for Qwen3.5 hybrid model (Gated DeltaNet + Full Attention).
+
+    Qwen3.5 uses a 3:1 ratio of linear attention (Gated DeltaNet, a Mamba2 variant)
+    to full attention layers.
+
+    Attributes:
+        layer_types (list[str]): List of layer types ("linear_attention" or "full_attention")
+        full_attention_interval (int): Interval for full attention layers (e.g., 4 means every 4th layer)
+        linear_conv_kernel_dim (int): Conv kernel dim for linear attention
+        linear_key_head_dim (int): Key head dimension for linear attention
+        linear_num_key_heads (int): Number of key heads for linear attention
+        linear_num_value_heads (int): Number of value heads for linear attention
+        linear_value_head_dim (int): Value head dimension for linear attention
+        mtp_num_hidden_layers (int): Number of MTP (Multi-Token Prediction) layers
+        attn_output_gate (bool): Whether attention has output gating
+    """
+
+    layer_types: tuple  # tuple for immutability
+    full_attention_interval: int
+    linear_conv_kernel_dim: int
+    linear_key_head_dim: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_value_head_dim: int
+    mtp_num_hidden_layers: int = 0
+    attn_output_gate: bool = True
+
+
 def _get_support_matrix_resource():
     """Get the support_matrix.csv as a Traversable resource."""
     return pkg_resources.files("aiconfigurator") / "systems" / "support_matrix.csv"
@@ -251,6 +282,8 @@ DefaultHFModels = {
     "Qwen/Qwen3-Coder-480B-A35B-Instruct",
     "nvidia/Qwen3-235B-A22B-NVFP4",
     "Qwen/Qwen3-32B-FP8-Static-PerTensor",
+    # Qwen 3.5 Models
+    "Qwen/Qwen3.5-27B-FP8",
     # GPT-OSS Models
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -277,7 +310,7 @@ SupportedSystems = {
 """
 Model family for model definition
 """
-ModelFamily = {"GPT", "LLAMA", "MOE", "DEEPSEEK", "NEMOTRONNAS", "NEMOTRONH"}
+ModelFamily = {"GPT", "LLAMA", "MOE", "DEEPSEEK", "NEMOTRONNAS", "NEMOTRONH", "QWEN35"}
 ARCHITECTURE_TO_MODEL_FAMILY = {
     "LlamaForCausalLM": "LLAMA",
     "Qwen2ForCausalLM": "LLAMA",
@@ -290,6 +323,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     "MixtralForCausalLM": "MOE",
     "GptOssForCausalLM": "MOE",
     "Qwen3MoeForCausalLM": "MOE",
+    "Qwen3_5ForConditionalGeneration": "QWEN35",
 }
 
 """
