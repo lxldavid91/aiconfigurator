@@ -78,6 +78,7 @@ class Qwen3_5Config:
         linear_value_head_dim (int): Value head dimension for linear attention
         mtp_num_hidden_layers (int): Number of MTP (Multi-Token Prediction) layers
         attn_output_gate (bool): Whether attention has output gating
+        vision_config (VisionConfig): Optional vision encoder configuration for multimodal
     """
 
     layer_types: tuple  # tuple for immutability
@@ -89,6 +90,37 @@ class Qwen3_5Config:
     linear_value_head_dim: int
     mtp_num_hidden_layers: int = 0
     attn_output_gate: bool = True
+    vision_config: "VisionConfig | None" = None
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """
+    Configuration for Vision Encoder in multimodal models (e.g., Qwen3.5-VL).
+
+    Attributes:
+        depth (int): Number of vision transformer layers
+        hidden_size (int): Hidden dimension of vision encoder
+        num_heads (int): Number of attention heads
+        intermediate_size (int): FFN intermediate dimension
+        patch_size (int): Size of image patches
+        in_channels (int): Number of input channels (3 for RGB)
+        num_position_embeddings (int): Number of position embeddings
+        out_hidden_size (int): Output dimension (maps to LLM hidden size)
+        spatial_merge_size (int): Spatial merge factor
+        temporal_patch_size (int): Temporal patch size for video
+    """
+
+    depth: int
+    hidden_size: int
+    num_heads: int
+    intermediate_size: int
+    patch_size: int
+    in_channels: int = 3
+    num_position_embeddings: int = 2304
+    out_hidden_size: int = 5120
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
 
 
 def _get_support_matrix_resource():

@@ -494,6 +494,28 @@ def _parse_hf_config_json(config: dict) -> dict:
     elif architecture == "Qwen3_5ForConditionalGeneration":
         # Qwen3.5 hybrid configuration (Gated DeltaNet + Full Attention)
         layer_types = cfg.get("layer_types", [])
+        
+        # Parse vision config if present (multimodal)
+        vision_cfg = None
+        if "vision_config" in config:
+            vc = config["vision_config"]
+            vision_cfg = common.VisionConfig(
+                depth=vc.get("depth", 27),
+                hidden_size=vc.get("hidden_size", 1152),
+                num_heads=vc.get("num_heads", 16),
+                intermediate_size=vc.get("intermediate_size", 4304),
+                patch_size=vc.get("patch_size", 16),
+                in_channels=vc.get("in_channels", 3),
+                num_position_embeddings=vc.get("num_position_embeddings", 2304),
+                out_hidden_size=vc.get("out_hidden_size", 5120),
+                spatial_merge_size=vc.get("spatial_merge_size", 2),
+                temporal_patch_size=vc.get("temporal_patch_size", 2),
+            )
+            logger.info(
+                f"Qwen3.5 vision config: depth={vision_cfg.depth}, "
+                f"hidden_size={vision_cfg.hidden_size}, num_heads={vision_cfg.num_heads}"
+            )
+        
         extra_params = common.Qwen3_5Config(
             layer_types=tuple(layer_types),
             full_attention_interval=cfg.get("full_attention_interval", 4),
@@ -504,13 +526,15 @@ def _parse_hf_config_json(config: dict) -> dict:
             linear_value_head_dim=cfg.get("linear_value_head_dim", 128),
             mtp_num_hidden_layers=cfg.get("mtp_num_hidden_layers", 0),
             attn_output_gate=cfg.get("attn_output_gate", True),
+            vision_config=vision_cfg,
         )
         linear_count = sum(1 for t in layer_types if t == "linear_attention")
         full_count = sum(1 for t in layer_types if t == "full_attention")
         logger.info(
             f"Qwen3.5 hybrid config: layers={len(layer_types)}, "
             f"linear_attention={linear_count}, full_attention={full_count}, "
-            f"interval={extra_params.full_attention_interval}"
+            f"interval={extra_params.full_attention_interval}, "
+            f"multimodal={vision_cfg is not None}"
         )
 
     logger.info(

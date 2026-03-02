@@ -3065,6 +3065,33 @@ class Qwen3_5Model(BaseModel):
 
         self.context_ops = []
 
+        # Vision Encoder (for multimodal models)
+        if cfg.vision_config is not None:
+            vc = cfg.vision_config
+            self.context_ops.extend(
+                [
+                    ops.VisionEncoder(
+                        "context_vision_encoder",
+                        1,  # scale_factor: process one image at a time
+                        depth=vc.depth,
+                        hidden_size=vc.hidden_size,
+                        num_heads=vc.num_heads,
+                        intermediate_size=vc.intermediate_size,
+                        patch_size=vc.patch_size,
+                        in_channels=vc.in_channels,
+                        quant_mode=gemm_quant_mode,
+                    ),
+                    ops.VisionMerger(
+                        "context_vision_merger",
+                        1,
+                        vision_hidden_size=vc.hidden_size,
+                        llm_hidden_size=vc.out_hidden_size,
+                        spatial_merge_size=vc.spatial_merge_size,
+                        quant_mode=gemm_quant_mode,
+                    ),
+                ]
+            )
+
         # Embedding
         self.context_ops.append(ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3))
 
